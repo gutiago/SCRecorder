@@ -23,6 +23,8 @@ typedef NS_ENUM(NSInteger, SCFlashMode) {
 
 @optional
 
+- (void)recorderGyro:(NSArray *__nonnull)gyro;
+
 /**
  Called when the recorder has reconfigured the videoInput
  */

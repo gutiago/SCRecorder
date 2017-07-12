@@ -8,6 +8,7 @@
 
 #import "SCRecorder.h"
 #import "SCRecordSession_Internal.h"
+#import <CoreMotion/CoreMotion.h>
 #define dispatch_handler(x) if (x != nil) dispatch_async(dispatch_get_main_queue(), x)
 #define kSCRecorderRecordSessionQueueKey "SCRecorderRecordSessionQueue"
 #define kMinTimeBetweenAppend 0.004
@@ -40,6 +41,13 @@
     size_t _transformFilterBufferHeight;
 }
 
+@property(nonatomic, retain) __attribute__((NSObject)) CMClockRef motionClock;
+@property(nonatomic, retain) __attribute__((NSObject)) CMClockRef sampleBufferClock;
+@property(nonatomic, retain) NSOperationQueue *motionQueue;
+@property(nonatomic, retain) CMMotionManager *motionManager;
+@property(nonatomic, retain) NSMutableArray *mediaSamples;
+@property(nonatomic, retain) NSMutableArray *motionSamples;
+
 @end
 
 @implementation SCRecorder
@@ -49,6 +57,10 @@ static char* SCRecorderExposureContext = "ExposureContext";
 static char* SCRecorderVideoEnabledContext = "VideoEnabledContext";
 static char* SCRecorderAudioEnabledContext = "AudioEnabledContext";
 static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
+
+
+
+double onedec_degree_rads = M_PI / 1800.0;
 
 - (id)init {
     self = [super init];
@@ -66,7 +78,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
         
         _videoOrientation = AVCaptureVideoOrientationPortrait;
         _videoStabilizationMode = AVCaptureVideoStabilizationModeStandard;
-
+        
         [[NSNotificationCenter defaultCenter] addObserver:self  selector:@selector(_subjectAreaDidChange) name:AVCaptureDeviceSubjectAreaDidChangeNotification  object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(sessionInterrupted:) name:AVAudioSessionInterruptionNotification object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(applicationDidEnterBackground:) name:UIApplicationDidEnterBackgroundNotification object:nil];
@@ -80,9 +92,9 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
         _lastAudioBuffer = [SCSampleBufferHolder new];
         _maxRecordDuration = kCMTimeInvalid;
         _resetZoomOnChangeDevice = YES;
-		_mirrorOnFrontCamera = NO;
-		_automaticallyConfiguresApplicationAudioSession = YES;
-		
+        _mirrorOnFrontCamera = NO;
+        _automaticallyConfiguresApplicationAudioSession = YES;
+        
         self.device = AVCaptureDevicePositionBack;
         _videoConfiguration = [SCVideoConfiguration new];
         _audioConfiguration = [SCAudioConfiguration new];
@@ -93,6 +105,24 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
         [_photoConfiguration addObserver:self forKeyPath:@"options" options:NSKeyValueObservingOptionNew context:SCRecorderPhotoOptionsContext];
         
         _context = [SCContext new].CIContext;
+        
+        //MARK: - MOTION CONFIG
+        
+        _motionManager = [[CMMotionManager alloc] init];
+        _motionManager.gyroUpdateInterval = [_motionManager deviceMotionUpdateInterval];
+        
+        valuesGyro = [[NSMutableArray alloc] init];
+        
+        _mediaSamples = [[NSMutableArray alloc] init];
+        _motionSamples = [[NSMutableArray alloc] init];
+        
+        _motionQueue = [[NSOperationQueue alloc] init];
+        [_motionQueue setMaxConcurrentOperationCount:1];
+        
+        _motionClock = CMClockGetHostTimeClock();
+        if (_motionClock)
+            CFRetain(_motionClock);
+        
     }
     
     return self;
@@ -104,6 +134,12 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
     [_photoConfiguration removeObserver:self forKeyPath:@"options"];
     
     [[NSNotificationCenter defaultCenter] removeObserver:self];
+    
+    if (_sampleBufferClock)
+        CFRelease(_sampleBufferClock);
+    if (_motionClock)
+        CFRelease(_motionClock);
+    
     [self unprepare];
 }
 
@@ -300,7 +336,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
     }
     
     AVCaptureSession *session = [[AVCaptureSession alloc] init];
-	session.automaticallyConfiguresApplicationAudioSession = self.automaticallyConfiguresApplicationAudioSession;
+    session.automaticallyConfiguresApplicationAudioSession = self.automaticallyConfiguresApplicationAudioSession;
     _beginSessionConfigurationCount = 0;
     _captureSession = session;
     
@@ -328,6 +364,17 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
     }
     
     if (!_captureSession.isRunning) {
+        if ( self.motionManager.deviceMotionAvailable ) {
+            CMDeviceMotionHandler motionHandler = ^(CMDeviceMotion *motion, NSError *error) {
+                if ( !error )
+                    [self.motionSamples addObject:motion];
+                else
+                    NSLog(@"%@", error);
+            };
+            
+            [self.motionManager startDeviceMotionUpdatesToQueue:self.motionQueue withHandler:motionHandler];
+        }
+        
         [_captureSession startRunning];
     }
     
@@ -342,7 +389,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
     id<SCRecorderDelegate> delegate = self.delegate;
     
     if (![delegate respondsToSelector:@selector(recorderShouldAutomaticallyRefocus:)] || [delegate recorderShouldAutomaticallyRefocus:self]) {
-        [self focusCenter];        
+        [self focusCenter];
     }
 }
 
@@ -453,6 +500,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
 
 - (void)record {
     void (^block)() = ^{
+        
         _isRecording = YES;
         if (_movieOutput != nil && _session != nil) {
             _movieOutput.maxRecordedDuration = self.maxRecordDuration;
@@ -476,7 +524,9 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
 
 - (void)pause:(void(^)())completionHandler {
     _isRecording = NO;
-    
+    //[motionManager stopGyroUpdates];
+    //[self printFramesCoordinates];
+    [self _findNearestMotionValues];
     void (^block)() = ^{
         SCRecordSession *recordSession = _session;
         
@@ -649,6 +699,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
 }
 
 - (void)captureOutput:(AVCaptureFileOutput *)captureOutput didStartRecordingToOutputFileAtURL:(NSURL *)fileURL fromConnections:(NSArray *)connections {
+    
     dispatch_async(_sessionQueue, ^{
         [_session notifyMovieFileOutputIsReady];
         
@@ -704,11 +755,11 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
         if (!recordSession.videoInitialized) {
             NSError *error = nil;
             NSDictionary *settings = [self.videoConfiguration createAssetWriterOptionsUsingSampleBuffer:sampleBuffer];
-
+            
             CMFormatDescriptionRef formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer);
             [recordSession initializeVideo:settings formatDescription:formatDescription error:&error];
-//            NSLog(@"INITIALIZED VIDEO");
-
+            //            NSLog(@"INITIALIZED VIDEO");
+            
             id<SCRecorderDelegate> delegate = self.delegate;
             if ([delegate respondsToSelector:@selector(recorder:didInitializeVideoInSession:error:)]) {
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -716,32 +767,46 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
                 });
             }
         }
-
+        
         if (!self.audioEnabledAndReady || recordSession.audioInitialized || recordSession.audioInitializationFailed) {
             [self beginRecordSegmentIfNeeded:recordSession];
-
+            
             if (_isRecording && recordSession.recordSegmentReady) {
                 id<SCRecorderDelegate> delegate = self.delegate;
                 CMTime duration = [self frameDurationFromConnection:connection];
-
+                
                 double timeToWait = kMinTimeBetweenAppend - (CACurrentMediaTime() - _lastAppendedVideoTime);
-
+                
                 if (timeToWait > 0) {
                     // Letting some time to for the AVAssetWriter to be ready
                     //                                    NSLog(@"Too fast! Waiting %fs", timeToWait);
                     [NSThread sleepForTimeInterval:timeToWait];
                 }
                 BOOL isFirstVideoBuffer = !recordSession.currentSegmentHasVideo;
-//                NSLog(@"APPENDING");
+                //                NSLog(@"APPENDING");
                 [self appendVideoSampleBuffer:sampleBuffer toRecordSession:recordSession duration:duration connection:connection completion:^(BOOL success) {
                     _lastAppendedVideoTime = CACurrentMediaTime();
                     if (success) {
+                        /*if (isFirstFrame == false) {
+                         double timeStamp = [[motionManager gyroData] timestamp];
+                         firstFrameTimestamp = timeStamp;
+                         isFirstFrame = true;
+                         }*/
+                        
+                        [self setSampleBufferClock: _captureSession.masterClock];
+                        
+                        [self convertSampleBufferTimeToMotionClock: sampleBuffer];
+                        
+                        //[self appendSampleBufferForSynchronization: sampleBuffer];
+                        
+                        frameCount++;
+                        
                         if ([delegate respondsToSelector:@selector(recorder:didAppendVideoSampleBufferInSession:)]) {
                             dispatch_async(dispatch_get_main_queue(), ^{
                                 [delegate recorder:self didAppendVideoSampleBufferInSession:recordSession];
                             });
                         }
-
+                        
                         [self checkRecordSessionDuration:recordSession];
                     } else {
                         if ([delegate respondsToSelector:@selector(recorder:didSkipVideoSampleBufferInSession:)]) {
@@ -751,7 +816,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
                         }
                     }
                 }];
-
+                
                 if (isFirstVideoBuffer && !recordSession.currentSegmentHasAudio) {
                     CMSampleBufferRef audioBuffer = _lastAudioBuffer.sampleBuffer;
                     if (audioBuffer != nil) {
@@ -766,7 +831,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
                 }
             }
         } else {
-//            NSLog(@"SKIPPING");
+            //            NSLog(@"SKIPPING");
         }
     }
 }
@@ -778,8 +843,8 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
             NSDictionary *settings = [self.audioConfiguration createAssetWriterOptionsUsingSampleBuffer:sampleBuffer];
             CMFormatDescriptionRef formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer);
             [recordSession initializeAudio:settings formatDescription:formatDescription error:&error];
-//            NSLog(@"INITIALIZED AUDIO");
-
+            //            NSLog(@"INITIALIZED AUDIO");
+            
             id<SCRecorderDelegate> delegate = self.delegate;
             if ([delegate respondsToSelector:@selector(recorder:didInitializeAudioInSession:error:)]) {
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -787,14 +852,14 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
                 });
             }
         }
-
+        
         if (!self.videoEnabledAndReady || recordSession.videoInitialized || recordSession.videoInitializationFailed) {
             [self beginRecordSegmentIfNeeded:recordSession];
-
+            
             if (_isRecording && recordSession.recordSegmentReady && (!self.videoEnabledAndReady || recordSession.currentSegmentHasVideo)) {
                 id<SCRecorderDelegate> delegate = self.delegate;
-//                NSLog(@"APPENDING");
-
+                //                NSLog(@"APPENDING");
+                
                 [recordSession appendAudioSampleBuffer:sampleBuffer completion:^(BOOL success) {
                     if (success) {
                         if ([delegate respondsToSelector:@selector(recorder:didAppendAudioSampleBufferInSession:)]) {
@@ -802,7 +867,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
                                 [delegate recorder:self didAppendAudioSampleBufferInSession:recordSession];
                             });
                         }
-
+                        
                         [self checkRecordSessionDuration:recordSession];
                     } else {
                         if ([delegate respondsToSelector:@selector(recorder:didSkipAudioSampleBufferInSession:)]) {
@@ -813,7 +878,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
                     }
                 }];
             } else {
-//                NSLog(@"SKIPPING");
+                //                NSLog(@"SKIPPING");
             }
         }
     }
@@ -822,12 +887,13 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
 - (void)captureOutput:(AVCaptureOutput *)captureOutput didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
     if (captureOutput == _videoOutput) {
         _lastVideoBuffer.sampleBuffer = sampleBuffer;
-//        NSLog(@"VIDEO BUFFER: %fs (%fs)", CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)), CMTimeGetSeconds(CMSampleBufferGetDuration(sampleBuffer)));
-
+        //        NSLog(@"VIDEO BUFFER: %fs (%fs)", CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)), CMTimeGetSeconds(CMSampleBufferGetDuration(sampleBuffer)));
+        
+        
         if (_videoConfiguration.shouldIgnore) {
             return;
         }
-
+        
         SCImageView *imageView = _SCImageView;
         if (imageView != nil) {
             CFRetain(sampleBuffer);
@@ -838,17 +904,19 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
         }
     } else if (captureOutput == _audioOutput) {
         _lastAudioBuffer.sampleBuffer = sampleBuffer;
-//        NSLog(@"AUDIO BUFFER: %fs (%fs)", CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)), CMTimeGetSeconds(CMSampleBufferGetDuration(sampleBuffer)));
-
+        //        NSLog(@"AUDIO BUFFER: %fs (%fs)", CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)), CMTimeGetSeconds(CMSampleBufferGetDuration(sampleBuffer)));
+        
         if (_audioConfiguration.shouldIgnore) {
             return;
         }
     }
-
+    
+    
     if (!_initializeSessionLazily || _isRecording) {
         SCRecordSession *recordSession = _session;
         if (recordSession != nil) {
             if (captureOutput == _videoOutput) {
+                
                 [self _handleVideoSampleBuffer:sampleBuffer withSession:recordSession connection:connection];
             } else if (captureOutput == _audioOutput) {
                 [self _handleAudioSampleBuffer:sampleBuffer withSession:recordSession];
@@ -856,6 +924,216 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
         }
     }
 }
+
+NSMutableArray *valuesGyro;
+double firstFrameTimestamp;
+double frameCount = 0.0;
+bool isFirstFrame = false;
+bool isGyroWithHandler = false;
+
+
+
+- (void)_adjustToReference:(int)refIndex {
+    NSMutableArray *refGyroData = valuesGyro[refIndex];
+    NSNumber *xRef  = refGyroData[0];
+    NSNumber *yRef  = refGyroData[1];
+    NSNumber *zRef  = refGyroData[2];
+    for (int i = refIndex + 1; i < [valuesGyro count]; i++) {
+        NSMutableArray *gyroData = valuesGyro[i];
+        NSNumber *x = gyroData[0];
+        NSNumber *y = gyroData[1];
+        NSNumber *z = gyroData[2];
+        gyroData[0] =  [NSNumber numberWithDouble:(x.doubleValue - xRef.doubleValue)];
+        gyroData[1] =  [NSNumber numberWithDouble:(y.doubleValue - yRef.doubleValue)];
+        gyroData[2] =   [NSNumber numberWithDouble:(z.doubleValue - zRef.doubleValue)];
+    }
+    
+    refGyroData[0] =  @(0.0);
+    refGyroData[1] =  @(0.0);
+    refGyroData[2] =  @(0.0);
+    
+}
+
+- (NSArray *)_prepareMotionSamples:(int)refIndex {
+    double accX = 0.0;
+    double accY = 0.0;
+    double accZ = 0.0;
+    
+    double accAccelerationX = 0.0;
+    double accAccelerationY = 0.0;
+    double accAccelerationZ = 0.0;
+    
+    double initialTimestamp = 0.0;
+    NSMutableArray *responseArray = [[NSMutableArray alloc] init];
+    
+    for (int i = 0 ; i < [self.motionSamples count]; i++) {
+        
+        CMDeviceMotion *motion = self.motionSamples[i];
+        
+        
+        if(i == refIndex) {
+            //frame start point
+            accX = 0.0;
+            accY = 0.0;
+            accZ = 0.0;
+            
+            accAccelerationX = 0.0;
+            accAccelerationY = 0.0;
+            accAccelerationZ = 0.0;
+            
+            initialTimestamp = 0.0;
+            
+        }
+        
+        if (initialTimestamp != 0.0) {
+            
+            double delta = [motion timestamp] - initialTimestamp;
+            
+            double rotX = [motion rotationRate].x * delta;
+            double rotY = [motion rotationRate].y * delta;
+            double rotZ = [motion rotationRate].z * delta;
+            
+            double distX = ([motion userAcceleration].x * delta * delta) / 2;
+            double distY = ([motion userAcceleration].y * delta * delta) / 2;
+            double distZ = ([motion userAcceleration].z * delta * delta) / 2;
+            
+            NSMutableArray *value =  [[NSMutableArray alloc] init];
+            
+            if  (fabs(rotX) >= onedec_degree_rads) {
+                accX += rotX;
+            }
+            
+            if  (fabs(rotY) >= onedec_degree_rads) {
+                accY += rotY;
+            }
+            
+            if  (fabs(rotZ) >= onedec_degree_rads) {
+                accZ += rotZ;
+            }
+            
+            accAccelerationX += distX;
+            accAccelerationY += distY;
+            accAccelerationZ += distZ;
+            
+            [value addObject: [NSNumber numberWithDouble: accX]];
+            [value addObject: [NSNumber numberWithDouble: accY]];
+            [value addObject: [NSNumber numberWithDouble: accZ]];
+            
+            [value addObject: [NSNumber numberWithDouble: accAccelerationX]];
+            [value addObject: [NSNumber numberWithDouble: accAccelerationY]];
+            [value addObject: [NSNumber numberWithDouble: accAccelerationZ]];
+            
+            [responseArray addObject: value];
+            
+            
+        } else {
+            [responseArray addObject: @[ @(0.0), @(0.0), @(0.0), @(0.0), @(0.0), @(0.0)]];
+        }
+        initialTimestamp =  [motion timestamp];
+        
+    }
+    return responseArray;
+}
+
+
+
+CFStringRef const VLIZ_REMAPPED_PTS = CFSTR("RemappedPTS");
+
+- (void)convertSampleBufferTimeToMotionClock:(CMSampleBufferRef)sampleBuffer
+{
+    CMTime originalPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    CMTime remappedPTS = CMSyncConvertTime(originalPTS, self.sampleBufferClock, self.motionClock);
+    
+    [self.mediaSamples addObject: [[NSNumber alloc] initWithDouble: CMTimeGetSeconds(remappedPTS)]];
+    
+    // Attach the remapped timestamp to the buffer for use in -sync
+    /*CFDictionaryRef remappedPTSDict = CMTimeCopyAsDictionary(remappedPTS, kCFAllocatorDefault);
+     CMSetAttachment(sampleBuffer, VLIZ_REMAPPED_PTS, remappedPTSDict, kCMAttachmentMode_ShouldPropagate);
+     
+     CFRelease(remappedPTSDict);*/
+}
+
+/*- (void)appendSampleBufferForSynchronization:(CMSampleBufferRef)sampleBuffer
+ {
+ if ( self.sampleBufferClock && self.motionClock ) {
+ if ( !CFEqual(self.sampleBufferClock, self.motionClock) ) {
+ [self convertSampleBufferTimeToMotionClock: sampleBuffer];
+ }
+ }
+ 
+ @synchronized(self) {
+ [self.mediaSamples addObject: (id)sampleBuffer];
+ }
+ }*/
+
+- (int)_findNearest:(int)initialIndex and: (double)value {
+    int foundIndex = initialIndex;
+    double currentNearest = (double)INTMAX_MAX;
+    for (int i = initialIndex; i < [valuesGyro count]; i++) {
+        NSNumber *timestamp = valuesGyro[i][3];
+        if (fabs(timestamp.doubleValue - value) < currentNearest) {
+            currentNearest = fabs(timestamp.doubleValue - value);
+            foundIndex = i;
+        } else {
+            return foundIndex;
+        }
+    }
+    return foundIndex;
+}
+
+
+- (int)_findFirstIndexBiggerThan:(double)value {
+    for (int i = 0; i < [valuesGyro count]; i++) {
+        NSNumber *timestamp = valuesGyro[i][3];
+        if (timestamp.doubleValue > value) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+-(void)_findNearestMotionValues {
+    int mediaIndex;
+    
+    NSMutableArray *responseArray = [[NSMutableArray alloc] init];
+    NSArray *refValuesArray = [[NSMutableArray alloc] init];
+    int closestMotionIndex = 0;
+    for (mediaIndex = 0; mediaIndex < [self.mediaSamples count]; mediaIndex++ ) {
+        NSNumber *mediaSample = [self.mediaSamples objectAtIndex:mediaIndex];
+        double mediaTimeSeconds = mediaSample.doubleValue;
+        double closestDifference = DBL_MAX;
+        int motionIndex;
+        
+        for ( motionIndex = closestMotionIndex; motionIndex < [self.motionSamples count]; motionIndex++ ) {
+            CMDeviceMotion *motionSample = [self.motionSamples objectAtIndex:motionIndex];
+            double motionTimeSeconds = [motionSample timestamp];
+            double difference = fabs(mediaTimeSeconds - motionTimeSeconds);
+            
+            if ( difference < closestDifference ) {
+                closestDifference = difference;
+                closestMotionIndex = motionIndex;
+            }
+            else {
+                break;
+            }
+        }
+        
+        if( mediaIndex == 0 ) {
+            refValuesArray = [self _prepareMotionSamples: closestMotionIndex];
+        }
+        
+        [responseArray addObject: refValuesArray[closestMotionIndex]];
+        
+        
+    }
+    
+    if ([_delegate respondsToSelector:@selector(recorderGyro:)]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [_delegate recorderGyro: responseArray];
+        });
+    }
+}
+     
 
 - (NSDictionary *)_createSegmentInfo {
     id<SCRecorderDelegate> delegate = self.delegate;
@@ -870,7 +1148,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
 
 - (void)_focusDidComplete {
     id<SCRecorderDelegate> delegate = self.delegate;
-
+    
     [self setAdjustingFocus:NO];
     
     if ([delegate respondsToSelector:@selector(recorderDidEndFocus:)]) {
@@ -901,11 +1179,11 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
         BOOL isAdjustingExposure = [[change objectForKey:NSKeyValueChangeNewKey] boolValue];
         
         [self setAdjustingExposure:isAdjustingExposure];
-
+        
         if (isAdjustingExposure) {
             if ([delegate respondsToSelector:@selector(recorderDidStartAdjustingExposure:)]) {
                 [delegate recorderDidStartAdjustingExposure:self];
-            }            
+            }
         } else {
             if ([delegate respondsToSelector:@selector(recorderDidEndAdjustingExposure:)]) {
                 [delegate recorderDidEndAdjustingExposure:self];
@@ -1141,7 +1419,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
         }
         
         device.subjectAreaChangeMonitoringEnabled = !continuousMode;
-
+        
         [device unlockForConfiguration];
         
         id<SCRecorderDelegate> delegate = self.delegate;
@@ -1402,7 +1680,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
         [self willChangeValueForKey:@"isAdjustingFocus"];
         
         _adjustingFocus = adjustingFocus;
-                
+        
         [self didChangeValueForKey:@"isAdjustingFocus"];
     }
 }

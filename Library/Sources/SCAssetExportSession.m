@@ -21,7 +21,7 @@
 
 
 #define IS_IPHONE ( [[[UIDevice currentDevice] model] isEqualToString:@"iPhone"] )
-#define IS_HEIGHT_GTE_568 [[UIScreen mainScreen ] bounds].size.height >= 568.0f
+#define IS_HEIGHT_GTE_568 [[UIScreen mainScreen ] bounds].size.height == 568.0f
 #define IS_IPHONE_5 ( IS_IPHONE && IS_HEIGHT_GTE_568 )
 
 @interface SCAssetExportSession() {
@@ -211,8 +211,11 @@ static CGContextRef SCCreateContextFromPixelBuffer(CVPixelBufferRef pixelBuffer)
 }
 
 
-
+unsigned long long MIN_FREE =  8 * 1024 * 1024;
 - (void)beginReadWriteOnVideo {
+    if (IS_IPHONE_5) {
+        MIN_FREE =  6 * 1024 * 1024;
+    }
     if (_videoInput != nil) {
         __block BOOL shouldReadNextBuffer = YES;
         
@@ -247,8 +250,8 @@ static CGContextRef SCCreateContextFromPixelBuffer(CVPixelBufferRef pixelBuffer)
                
                 if (bufferHolder != nil) {
                     __strong typeof(self) strongSelf = wSelf;
-                   
-                    if ( (countFramesFiltering % 20) == 0 ) {
+                    countFramesFiltering++;
+                    if ( (countFramesFiltering % 60) == 0  || countFramesFiltering == 20 ) {
                          shouldReadNextBuffer = [self checkMemoryDuringProcess ];
                     }
                     if (shouldReadNextBuffer ){
@@ -267,7 +270,7 @@ static CGContextRef SCCreateContextFromPixelBuffer(CVPixelBufferRef pixelBuffer)
                     }
                     
                 }
-                countFramesFiltering++;
+               
                 return pixelBuffers;
             }];
             
@@ -367,12 +370,9 @@ static CGContextRef SCCreateContextFromPixelBuffer(CVPixelBufferRef pixelBuffer)
         }];
     }
 }
-unsigned long long MIN_FREE =  8 * 1024 * 1024;
+
 - (void)beginReadWriteOnAudio {
-  
-    if (IS_IPHONE_5) {
-        MIN_FREE =  6 * 1024 * 1024;
-    }
+
     if (_audioInput != nil) {
         dispatch_group_enter(_dispatchGroup);
         _needsLeaveAudio = YES;
@@ -722,18 +722,18 @@ unsigned long long MIN_FREE =  8 * 1024 * 1024;
         for (AVAssetTrack *track in [self.inputAsset tracksWithMediaType:AVMediaTypeVideo]) {
              fps =  MAX(fps, track.nominalFrameRate);
         }
-        unsigned long long MEM_TO_EXPORT = 90 * 1024 * 1024;
-        if ( fps <= 30.0 ) {
-             //maxtime(50 secs)
-            if (time < 30.0)  {
-               MEM_TO_EXPORT = 70 * 1024 * 1024;
-            }
-        } else {
-            //hiperlapse maxtime(20 secs)
-            if (time < 10.0)  {
-                MEM_TO_EXPORT = 80 * 1024 * 1024;
-            }
-        }
+        unsigned long long MEM_TO_EXPORT = 80 * 1024 * 1024;
+        
+        Float64  totalTime = fps/30 * time;
+        if (totalTime < 30.0)  {
+            MEM_TO_EXPORT = 50 * 1024 * 1024;
+        } else
+            if (totalTime < 60.0)  {
+                MEM_TO_EXPORT = 60 * 1024 * 1024;
+            } else
+                if (totalTime < 90.0)  {
+                    MEM_TO_EXPORT = 70 * 1024 * 1024;
+                }
         
         if(IS_IPHONE_5) {
             MEM_TO_EXPORT = MEM_TO_EXPORT * 0.5;

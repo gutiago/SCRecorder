@@ -19,6 +19,11 @@
 #define EnsureSuccess(error, x) if (error != nil) { _error = error; if (x != nil) x(); return; }
 #define kAudioFormatType kAudioFormatLinearPCM
 
+
+#define IS_IPHONE ( [[[UIDevice currentDevice] model] isEqualToString:@"iPhone"] )
+#define IS_HEIGHT_GTE_568 [[UIScreen mainScreen ] bounds].size.height >= 568.0f
+#define IS_IPHONE_5 ( IS_IPHONE && IS_HEIGHT_GTE_568 )
+
 @interface SCAssetExportSession() {
     AVAssetWriter *_writer;
     AVAssetReader *_reader;
@@ -205,43 +210,16 @@ static CGContextRef SCCreateContextFromPixelBuffer(CVPixelBufferRef pixelBuffer)
     }
 }
 
-- (Boolean) checkMemoryDuringProcess {
-    
-    
-    mach_port_t host_port;
-    mach_msg_type_number_t host_size;
-    vm_size_t pagesize;
-    
-    host_port = mach_host_self();
-    host_size = sizeof(vm_statistics_data_t) / sizeof(integer_t);
-    host_page_size(host_port, &pagesize);
-    
-    vm_statistics_data_t vm_stat;
-    
-    
-    if (host_statistics(host_port, HOST_VM_INFO, (host_info_t)&vm_stat, &host_size) == KERN_SUCCESS) {
-        
-        unsigned long long mem_free = vm_stat.free_count * pagesize;
-        
-        unsigned long long MIN_AVAILABLE = 6291456;
-        
-        if ( mem_free  <  MIN_AVAILABLE) {
-            
-            NSLog(@"|||||||||||||||| LOW MEMORY ON EXPORT (BELOW 6MB)---> free: %llu",  mem_free);
-            _error = [NSError errorWithDomain:@"Not enough memory for export during export!!!!!" code:-1 userInfo:nil];
-            return NO;
-        }
-        
-    }
-    return YES;
-}
+
 
 - (void)beginReadWriteOnVideo {
     if (_videoInput != nil) {
+        __block BOOL shouldReadNextBuffer = YES;
+        
         SCProcessingQueue *videoProcessingQueue = nil;
         SCProcessingQueue *filterRenderingQueue = nil;
         SCProcessingQueue *videoReadingQueue = [SCProcessingQueue new];
-        
+    
         __weak typeof(self) wSelf = self;
         
         videoReadingQueue.maxQueueSize = 2;
@@ -261,27 +239,35 @@ static CGContextRef SCCreateContextFromPixelBuffer(CVPixelBufferRef pixelBuffer)
         if (_videoPixelAdaptor != nil) {
             filterRenderingQueue = [SCProcessingQueue new];
             filterRenderingQueue.maxQueueSize = 2;
+           __block int countFramesFiltering = 0;
+            
             [filterRenderingQueue startProcessingWithBlock:^id{
                 SCIOPixelBuffers *pixelBuffers = nil;
                 SCSampleBufferHolder *bufferHolder = [videoReadingQueue dequeue];
-                
+               
                 if (bufferHolder != nil) {
                     __strong typeof(self) strongSelf = wSelf;
-                    
-                    if (strongSelf != nil) {
-                        pixelBuffers = [strongSelf createIOPixelBuffers:bufferHolder.sampleBuffer];
-                        CVPixelBufferLockBaseAddress(pixelBuffers.inputPixelBuffer, 0);
-                        if (pixelBuffers.outputPixelBuffer != pixelBuffers.inputPixelBuffer) {
-                            CVPixelBufferLockBaseAddress(pixelBuffers.outputPixelBuffer, 0);
+                   
+                    if ( (countFramesFiltering % 20) == 0 ) {
+                         shouldReadNextBuffer = [self checkMemoryDuringProcess ];
+                    }
+                    if (shouldReadNextBuffer ){
+                        if (strongSelf != nil) {
+                            pixelBuffers = [strongSelf createIOPixelBuffers:bufferHolder.sampleBuffer];
+                            CVPixelBufferLockBaseAddress(pixelBuffers.inputPixelBuffer, 0);
+                            if (pixelBuffers.outputPixelBuffer != pixelBuffers.inputPixelBuffer) {
+                                CVPixelBufferLockBaseAddress(pixelBuffers.outputPixelBuffer, 0);
+                            }
+                            pixelBuffers = [strongSelf renderIOPixelBuffersWithCI:pixelBuffers];
+                            
                         }
-                        pixelBuffers = [strongSelf renderIOPixelBuffersWithCI:pixelBuffers];
+                        
+                        bufferHolder.sampleBuffer = nil;
+                        bufferHolder = nil;
                     }
                     
-                    bufferHolder.sampleBuffer = nil;
-                    bufferHolder = nil;
-                    
                 }
-                
+                countFramesFiltering++;
                 return pixelBuffers;
             }];
             
@@ -300,16 +286,14 @@ static CGContextRef SCCreateContextFromPixelBuffer(CVPixelBufferRef pixelBuffer)
         
         dispatch_group_enter(_dispatchGroup);
         _needsLeaveVideo = YES;
-        
+        __block int countFrames = 0;
         [_videoInput requestMediaDataWhenReadyOnQueue:_videoQueue usingBlock:^{
-            BOOL shouldReadNextBuffer = YES;
+     
             __strong typeof(self) strongSelf = wSelf;
-            int countFrames = 0;
+           
             while (strongSelf.videoInput.isReadyForMoreMediaData && shouldReadNextBuffer && !strongSelf.cancelled) {
-                
                 SCIOPixelBuffers *videoBuffer = nil;
                 SCSampleBufferHolder *bufferHolder = nil;
-                
                 CMTime time;
                 if (videoProcessingQueue != nil) {
                     videoBuffer = [videoProcessingQueue dequeue];
@@ -320,12 +304,11 @@ static CGContextRef SCCreateContextFromPixelBuffer(CVPixelBufferRef pixelBuffer)
                         time = CMSampleBufferGetPresentationTimeStamp(bufferHolder.sampleBuffer);
                     }
                 }
-                
                 if (videoBuffer != nil || bufferHolder != nil) {
                     if (CMTIME_COMPARE_INLINE(time, >=, strongSelf.nextAllowedVideoFrame)) {
                         countFrames++;
-                        if ( (countFrames % 60) == 0) {
-                            shouldReadNextBuffer = [self checkMemoryDuringProcess ];
+                        if ( (countFrames % 60) == 0 || countFrames == 20) {
+                           shouldReadNextBuffer = [self checkMemoryDuringProcess ];
                         }
                         @try {
                             if ( shouldReadNextBuffer ) {
@@ -384,8 +367,12 @@ static CGContextRef SCCreateContextFromPixelBuffer(CVPixelBufferRef pixelBuffer)
         }];
     }
 }
-
+unsigned long long MIN_FREE =  8 * 1024 * 1024;
 - (void)beginReadWriteOnAudio {
+  
+    if (IS_IPHONE_5) {
+        MIN_FREE =  6 * 1024 * 1024;
+    }
     if (_audioInput != nil) {
         dispatch_group_enter(_dispatchGroup);
         _needsLeaveAudio = YES;
@@ -712,9 +699,9 @@ static CGContextRef SCCreateContextFromPixelBuffer(CVPixelBufferRef pixelBuffer)
     }
 }
 
+
+
 - (void)checkMemory:(NSError **) error {
-    
-    
     mach_port_t host_port;
     mach_msg_type_number_t host_size;
     vm_size_t pagesize;
@@ -728,33 +715,75 @@ static CGContextRef SCCreateContextFromPixelBuffer(CVPixelBufferRef pixelBuffer)
     if (host_statistics(host_port, HOST_VM_INFO, (host_info_t)&vm_stat, &host_size) == KERN_SUCCESS) {
         
         unsigned long long mem_free = vm_stat.free_count * pagesize;
-        //unsigned long long mem_inactive = vm_stat.inactive_count * pagesize;
-        unsigned long long mem_available = mem_free; // + mem_inactive;
+        unsigned long long mem_inactive = vm_stat.inactive_count * pagesize;
+        unsigned long long mem_available = mem_free + mem_inactive;
+        Float64  time = CMTimeGetSeconds(self.inputAsset.duration);
+        float fps = 0.00;
+        for (AVAssetTrack *track in [self.inputAsset tracksWithMediaType:AVMediaTypeVideo]) {
+             fps =  MAX(fps, track.nominalFrameRate);
+        }
+        unsigned long long MEM_TO_EXPORT = 90 * 1024 * 1024;
+        if ( fps <= 30.0 ) {
+             //maxtime(50 secs)
+            if (time < 30.0)  {
+               MEM_TO_EXPORT = 70 * 1024 * 1024;
+            }
+        } else {
+            //hiperlapse maxtime(20 secs)
+            if (time < 10.0)  {
+                MEM_TO_EXPORT = 80 * 1024 * 1024;
+            }
+        }
         
-        //NSLog(@"Pages free: %llu", (uint64_t) ((vm_stat.free_count - vm_stat.speculative_count)* pagesize));
-        //NSLog(@"Pages active: %llu", (uint64_t) (vm_stat.active_count* pagesize));
-        //NSLog(@"Pages inactive: %llu", (uint64_t) (vm_stat.inactive_count* pagesize));
-        //NSLog(@"Pages speculative: %llu", (uint64_t) (vm_stat.speculative_count* pagesize));
-        //NSLog(@"Pages wired down: %llu", (uint64_t) (vm_stat.wire_count* pagesize));
+        if(IS_IPHONE_5) {
+            MEM_TO_EXPORT = MEM_TO_EXPORT * 0.5;
+        }
+
+        CGFloat memoryNeeded = ((self.videoConfiguration.filter==nil && self.videoConfiguration.filter.subFilters == nil) ||
+                          self.videoConfiguration.filter.subFilters.count == 0 || self.videoConfiguration.filter.subFilters.count == 1) ? MEM_TO_EXPORT : MEM_TO_EXPORT * 2;
         
-        CGFloat maxTotalMemory = self.videoConfiguration.bufferSize.height * self.videoConfiguration.bufferSize.width * self.videoConfiguration.maxFrameRate * CMTimeGetSeconds(self.inputAsset.duration);
-        
-        CGFloat needed = ((self.videoConfiguration.filter==nil && self.videoConfiguration.filter.subFilters == nil) ||
-                          self.videoConfiguration.filter.subFilters.count == 0 || self.videoConfiguration.filter.subFilters.count == 1) ? 0.08 : 0.14;
-        
-        CGFloat memoryNeeded = maxTotalMemory * needed;
-        
-        
-        
+    
         if (memoryNeeded > mem_available) {
-            
             NSLog(@"|||||||||||||||| MEMORY --->  needed: %f  free: %llu", memoryNeeded, mem_available);
             *error = [NSError errorWithDomain:@"Not enough memory for export!!!!!" code:-1 userInfo:nil];
-            
         }
         
     }
 }
+
+unsigned long long MIN_AVAILABLE = 50 * 1024 * 1024;
+
+- (Boolean) checkMemoryDuringProcess {
+    
+    mach_port_t host_port;
+    mach_msg_type_number_t host_size;
+    vm_size_t pagesize;
+    
+    host_port = mach_host_self();
+    host_size = sizeof(vm_statistics_data_t) / sizeof(integer_t);
+    host_page_size(host_port, &pagesize);
+    
+    vm_statistics_data_t vm_stat;
+    
+    
+    if (host_statistics(host_port, HOST_VM_INFO, (host_info_t)&vm_stat, &host_size) == KERN_SUCCESS) {
+        
+        unsigned long long mem_free = vm_stat.free_count * pagesize;
+        // unsigned long long mem_inactive = vm_stat.inactive_count * pagesize;
+        // unsigned long long mem_available = mem_free + mem_inactive;
+
+        //NSLog(@"|||||||||||||||| LOW MEMORY ON EXPORT---> free: %llu , available: %llu",  mem_free, mem_available);
+        if ( mem_free < MIN_FREE ) {
+            
+            NSLog(@"|||||||||||||||| LOW MEMORY ON EXPORT (BELOW 8MB)---> free: %llu",  mem_free);
+            _error = [NSError errorWithDomain:@"Not enough memory for export during export!!!!!" code:-1 userInfo:nil];
+            return NO;
+        }
+        
+    }
+    return YES;
+}
+
 
 - (void)exportAsynchronouslyWithCompletionHandler:(void (^)())completionHandler {
     _cancelled = NO;
